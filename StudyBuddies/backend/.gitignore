@@ -1,0 +1,80 @@
+# Generated .gitignore patterns
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+coverage/
+.npm
+.eslintcache
+.yarn-integrity
+.env
+.env.test
+.cache
+.parcel-cache
+.next
+.nuxt
+dist/
+.serverless/
+
+# Log Files
+*.log
+*.log.*
+logs/
+log/
+/logs
+/log
+
+# Cache Files
+*.cache
+.cache/
+cache/
+**/cache/
+.npm/
+.yarn/
+
+# OS Generated
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Environment
+.env
+.env.*
+!.env.example
+.envrc
+.environment
+
+# Build Output
+build/
+dist/
+out/
+*.min.*
+*.map
+
+# IDE Files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+.vs/
+
+# Backup Files
+*.bak
+*.backup
+*.orig
+*.swp
+*.swo
+
+# Temporary Files
+*.tmp
+*.temp
+tmp/
+temp/
+~*
+*~
