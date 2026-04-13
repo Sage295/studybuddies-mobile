@@ -1,8 +1,10 @@
 import { useRef } from 'react';
 
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024;
+const MAX_AVATAR_DIMENSION = 512;
+const AVATAR_OUTPUT_QUALITY = 0.82;
 
-function fileToDataUrl(file: File) {
+function readFileAsDataUrl(file: File) {
   return new Promise<string>((resolve, reject) => {
     if (file.size > MAX_IMAGE_SIZE_BYTES) {
       reject(new Error('Image must be smaller than 5 MB.'));
@@ -14,6 +16,65 @@ function fileToDataUrl(file: File) {
     reader.onerror = () => reject(new Error('Unable to read image.'));
     reader.readAsDataURL(file);
   });
+}
+
+function loadImage(dataUrl: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('Unable to process image.'));
+    image.src = dataUrl;
+  });
+}
+
+function compressImageToDataUrl(image: HTMLImageElement, mimeType: string) {
+  const scale = Math.min(1, MAX_AVATAR_DIMENSION / Math.max(image.width, image.height));
+  const targetWidth = Math.max(1, Math.round(image.width * scale));
+  const targetHeight = Math.max(1, Math.round(image.height * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+
+  const context = canvas.getContext('2d');
+  if (!context) {
+    throw new Error('Unable to process image.');
+  }
+
+  context.drawImage(image, 0, 0, targetWidth, targetHeight);
+  return canvas.toDataURL(mimeType, AVATAR_OUTPUT_QUALITY);
+}
+
+function dataUrlToFile(dataUrl: string, filename: string) {
+  const [header, body] = dataUrl.split(',');
+  const mimeMatch = header.match(/data:(.*?);base64/);
+  const mimeType = mimeMatch?.[1] || 'image/jpeg';
+  const binary = atob(body);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  const extension = mimeType === 'image/png' ? 'png' : 'jpg';
+  const baseName = filename.replace(/\.[^.]+$/, '') || 'avatar';
+  return new File([bytes], `${baseName}.${extension}`, { type: mimeType });
+}
+
+async function prepareAvatarFile(file: File) {
+  const originalDataUrl = await readFileAsDataUrl(file);
+  const image = await loadImage(originalDataUrl);
+
+  // Use JPEG for oversized camera images to cut payload size significantly.
+  const preferredMimeType = file.type === 'image/png' && file.size < 900 * 1024
+    ? 'image/png'
+    : 'image/jpeg';
+
+  const compressedDataUrl = compressImageToDataUrl(image, preferredMimeType);
+  return {
+    previewUrl: compressedDataUrl,
+    file: dataUrlToFile(compressedDataUrl, file.name),
+  };
 }
 
 interface AvatarProps {
@@ -61,7 +122,10 @@ export function useImageUpload(onFile:(url:string)=>void) {
         style={{display:'none'}}
         onChange={async e=>{
           const f=e.target.files?.[0];
-          if(f) onFile(await fileToDataUrl(f));
+          if (f) {
+            const prepared = await prepareAvatarFile(f);
+            onFile(prepared.previewUrl);
+          }
           e.target.value='';
         }}
       />
@@ -75,7 +139,7 @@ interface UploadZoneProps {
   currentColor?: string;
   letter?: string;
   size?: number;
-  onFile: (url:string) => void;
+  onFile: (file: File, previewUrl: string) => void | Promise<void>;
   onError?: (message: string) => void;
   label?: string;
 }
@@ -125,7 +189,8 @@ export function AvatarUploadZone({currentUrl,currentColor='#5b8dee',letter='?',s
           const f=e.target.files?.[0];
           if (f) {
             try {
-              onFile(await fileToDataUrl(f));
+              const prepared = await prepareAvatarFile(f);
+              await onFile(prepared.file, prepared.previewUrl);
             } catch (error) {
               onError?.(error instanceof Error ? error.message : 'Unable to upload image.');
             }

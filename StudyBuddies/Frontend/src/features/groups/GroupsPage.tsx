@@ -3,6 +3,7 @@ import { Avatar, AvatarUploadZone } from '../../components/Avatar';
 import { useGroups } from '../../context/GroupsContext';
 import { useUser, randomColor } from '../../context/UserContext';
 import type { Group, Member } from '../../types';
+import { uploadProfileAvatar } from '../../api/profile';
 import {
   addGroupMembers,
   createGroup,
@@ -327,9 +328,11 @@ export default function GroupsPage() {
               currentColor={profile.avatarColor}
               letter={avatarLetter}
               size={88}
-              onFile={url => {
+              onFile={async (file, previewUrl) => {
                 setProfileSaveError('');
-                setEditAvatarUrl(url);
+                setEditAvatarUrl(previewUrl);
+                const { avatarUrl } = await uploadProfileAvatar(file);
+                setEditAvatarUrl(avatarUrl);
               }}
               onError={setProfileSaveError}
               label="Visible to all group members"
@@ -358,7 +361,7 @@ export default function GroupsPage() {
             </div>
             <p className="leave-modal-text">
               Are you sure you want to leave <strong className="leave-modal-strong">{selected.name}</strong>?
-              You will also be removed from the affiliated group chat.
+              You will lose access to this group's shared workspace and member list.
             </p>
             <div className="modal-footer">
               <button type="button" className="btn-ghost" onClick={() => setShowLeave(false)}>Cancel</button>

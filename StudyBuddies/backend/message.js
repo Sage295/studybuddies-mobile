@@ -12,6 +12,177 @@ function buildUserRoomName(userId) {
   return `user:${userId}`;
 }
 
+function buildComparableIdList(value) {
+  const ids = [];
+
+  if (value !== undefined && value !== null && value !== "") {
+    ids.push(value);
+  }
+
+  const numericValue = Number(value);
+  if (Number.isFinite(numericValue) && !ids.some(id => String(id) === String(numericValue))) {
+    ids.push(numericValue);
+  }
+
+  return ids;
+}
+
+function buildGroupChatDocumentLookup(groupId) {
+  const ids = buildComparableIdList(groupId);
+
+  return {
+    Type: "group",
+    $or: [
+      { GroupID: { $in: ids } },
+      { ChatID: { $in: ids } },
+    ],
+  };
+}
+
+function buildGroupChatBatchLookup(groupIds) {
+  const ids = buildComparableIdSet(groupIds);
+
+  return {
+    Type: "group",
+    $or: [
+      { GroupID: { $in: ids } },
+      { ChatID: { $in: ids } },
+    ],
+  };
+}
+
+function buildComparableIdSet(values) {
+  return [...new Set((values || []).flatMap(value => buildComparableIdList(value).map(id => String(id))))].map((id) => {
+    const numericId = Number(id);
+    return Number.isFinite(numericId) && String(numericId) === id ? numericId : id;
+  });
+}
+
+function getGroupChatKey(chat, fallbackGroupId) {
+  const candidate = chat?.GroupID ?? chat?.ChatID ?? fallbackGroupId;
+  const numericCandidate = Number(candidate);
+  return Number.isFinite(numericCandidate) ? numericCandidate : Number(fallbackGroupId);
+}
+
+function buildGroupMemberUserIdSet(group) {
+  return buildComparableIdSet((group?.Members || []).map(member => member.userId));
+}
+
+function scoreGroupChatCandidate(chat, group) {
+  let score = 0;
+  const targetGroupId = String(group.GroupID);
+  const chatGroupId = chat?.GroupID !== undefined ? String(chat.GroupID) : "";
+  const chatId = chat?.ChatID !== undefined ? String(chat.ChatID) : "";
+
+  if (chatGroupId === targetGroupId) score += 100;
+  if (chatId === targetGroupId) score += 80;
+  if ((chat.Name || "").trim().toLowerCase() === String(group.Name || "").trim().toLowerCase()) score += 20;
+  if (String(chat.CreatedByUserId || "") === String(group.CreatedByUserId || "")) score += 10;
+
+  const targetMembers = new Set(buildGroupMemberUserIdSet(group).map(value => String(value)));
+  const chatMembers = new Set(buildComparableIdSet([
+    ...(chat.MemberUserIds || []),
+    ...((chat.Members || []).map(member => member.userId)),
+  ]).map(value => String(value)));
+
+  for (const memberId of chatMembers) {
+    if (targetMembers.has(memberId)) {
+      score += 5;
+    }
+  }
+
+  if (targetMembers.size > 0 && targetMembers.size === chatMembers.size) {
+    let exactMatch = true;
+    for (const memberId of targetMembers) {
+      if (!chatMembers.has(memberId)) {
+        exactMatch = false;
+        break;
+      }
+    }
+
+    if (exactMatch) {
+      score += 25;
+    }
+  }
+
+  return score;
+}
+
+async function findGroupChatForGroup(db, group, projection) {
+  const exactMatch = await db.collection("Chats").findOne(
+    buildGroupChatDocumentLookup(group.GroupID),
+    projection ? { projection } : undefined,
+  );
+
+  if (exactMatch) {
+    return exactMatch;
+  }
+
+  const memberIds = buildGroupMemberUserIdSet(group);
+  const memberIdStrings = memberIds.map(value => String(value));
+  const candidateQuery = {
+    Type: "group",
+    $or: [
+      { Name: group.Name },
+      { CreatedByUserId: group.CreatedByUserId },
+      { "Members.userId": { $in: memberIds } },
+      { MemberUserIds: { $in: memberIdStrings } },
+    ],
+  };
+
+  const candidates = await db.collection("Chats").find(candidateQuery).toArray();
+  const bestCandidate = candidates
+    .map(chat => ({ chat, score: scoreGroupChatCandidate(chat, group) }))
+    .filter(entry => entry.score >= 20)
+    .sort((left, right) => right.score - left.score)[0]?.chat;
+
+  if (!bestCandidate) {
+    return null;
+  }
+
+  await db.collection("Chats").updateOne(
+    { _id: bestCandidate._id },
+    {
+      $set: {
+        Type: "group",
+        GroupID: Number(group.GroupID),
+        ChatID: Number(group.GroupID),
+        Name: group.Name || bestCandidate.Name,
+        CreatedByUserId: group.CreatedByUserId || bestCandidate.CreatedByUserId,
+        Color: group.Color || bestCandidate.Color || "#7c5cfc",
+        Members: group.Members || bestCandidate.Members || [],
+        MemberUserIds: (group.Members || bestCandidate.Members || []).map(member => String(member.userId)).sort(),
+      },
+    },
+  );
+
+  return db.collection("Chats").findOne(
+    buildGroupChatDocumentLookup(group.GroupID),
+    projection ? { projection } : undefined,
+  );
+}
+
+async function findExactGroupChatsByGroupIds(db, groupIds, projection) {
+  const ids = buildComparableIdSet(groupIds);
+  if (ids.length === 0) {
+    return new Map();
+  }
+
+  const chats = await db.collection("Chats").find(
+    buildGroupChatBatchLookup(ids),
+    projection ? { projection } : undefined,
+  ).toArray();
+
+  return new Map(chats.map(chat => [getGroupChatKey(chat), chat]));
+}
+
+async function findExactGroupChatByGroupId(db, groupId, projection) {
+  return db.collection("Chats").findOne(
+    buildGroupChatDocumentLookup(groupId),
+    projection ? { projection } : undefined,
+  );
+}
+
 function formatChatTimestamp(dateValue) {
   if (!dateValue) {
     return "";
@@ -72,10 +243,19 @@ function buildChatMessage(message, viewerId) {
   };
 }
 
+function normalizeAvatarUrl(value) {
+  const avatarUrl = String(value || "").trim();
+  if (!avatarUrl || avatarUrl.startsWith("data:")) {
+    return null;
+  }
+
+  return avatarUrl;
+}
+
 function buildChatSummaryForSocket(chat, viewerId, fallbackGroup) {
   if (chat?.Type === "group" || fallbackGroup) {
     const group = fallbackGroup || {
-      GroupID: chat.GroupID,
+      GroupID: getGroupChatKey(chat),
       Name: chat.Name,
       CreatedByUserId: chat.CreatedByUserId,
       Color: chat.Color,
@@ -126,7 +306,7 @@ function buildChatResponse(chat, viewerId) {
       email: member.email,
       isCreator: member.isCreator,
       color: member.color,
-      avatarUrl: null,
+      avatarUrl: normalizeAvatarUrl(member.avatarUrl),
     })),
     messages,
     lastMsg: chat.LastMessageText || "",
@@ -152,7 +332,7 @@ function buildChatSummaryResponse(chat, viewerId) {
       email: member.email,
       isCreator: member.isCreator,
       color: member.color,
-      avatarUrl: null,
+      avatarUrl: normalizeAvatarUrl(member.avatarUrl),
     })),
     messages: [],
     lastMsg: chat.LastMessageText || "",
@@ -206,7 +386,7 @@ function buildGroupChatFromGroup(group, chat, viewerId) {
       email: member.email,
       isCreator: member.isCreator,
       color: member.color,
-      avatarUrl: null,
+      avatarUrl: normalizeAvatarUrl(member.avatarUrl),
     })),
     messages: (chat?.Messages || []).map(message => buildChatMessage(message, viewerId)),
     lastMsg: chat?.LastMessageText || "",
@@ -230,7 +410,7 @@ function buildGroupChatSummaryFromGroup(group, chat, viewerId) {
       email: member.email,
       isCreator: member.isCreator,
       color: member.color,
-      avatarUrl: null,
+      avatarUrl: normalizeAvatarUrl(member.avatarUrl),
     })),
     messages: [],
     lastMsg: chat?.LastMessageText || "",
@@ -271,9 +451,13 @@ const CHAT_SUMMARY_PROJECTION = {
   "Members.email": 1,
   "Members.isCreator": 1,
   "Members.color": 1,
+  "Members.avatarUrl": 1,
+  "Messages.senderUserId": 1,
+  "Messages.createdAt": 1,
   LastMessageText: 1,
   UpdatedAt: 1,
   CreatedAt: 1,
+  ReadState: 1,
 };
 
 const CHAT_DETAIL_PROJECTION = {
@@ -289,6 +473,7 @@ const CHAT_DETAIL_PROJECTION = {
   "Members.email": 1,
   "Members.isCreator": 1,
   "Members.color": 1,
+  "Members.avatarUrl": 1,
   "Messages.id": 1,
   "Messages.senderUserId": 1,
   "Messages.senderUsername": 1,
@@ -321,6 +506,7 @@ const GROUP_DETAIL_PROJECTION = {
   "Members.email": 1,
   "Members.isCreator": 1,
   "Members.color": 1,
+  "Members.avatarUrl": 1,
 };
 
 const GROUP_SUMMARY_PROJECTION = {
@@ -335,6 +521,7 @@ const GROUP_SUMMARY_PROJECTION = {
   "Members.email": 1,
   "Members.isCreator": 1,
   "Members.color": 1,
+  "Members.avatarUrl": 1,
 };
 
 async function findAccountsByUsernames(db, usernames, helpers) {
@@ -449,6 +636,7 @@ function createMessagesRouter(client, helpers, io) {
             FirstName: 1,
             LastName: 1,
             Email: 1,
+            AvatarUrl: 1,
             AvatarColor: 1,
           },
         },
@@ -463,7 +651,7 @@ function createMessagesRouter(client, helpers, io) {
           displayName: buildDisplayName(user),
           email: user.Email,
           avatarColor: user.AvatarColor || "#5b8dee",
-          avatarUrl: null,
+          avatarUrl: normalizeAvatarUrl(user.AvatarUrl),
         })),
       });
     } catch (error) {
@@ -502,15 +690,14 @@ function createMessagesRouter(client, helpers, io) {
           .find(groupLookup, { projection: GROUP_SUMMARY_PROJECTION })
           .sort({ CreatedAt: -1 })
           .toArray();
-        const groupIds = groups.map(group => Number(group.GroupID)).filter(Number.isFinite);
-        const groupChats = groupIds.length > 0
-          ? await db.collection("Chats").find(
-            { Type: "group", GroupID: { $in: groupIds } },
-            { projection: CHAT_SUMMARY_PROJECTION },
-          ).toArray()
-          : [];
-        const chatByGroupId = new Map(groupChats.map(chat => [Number(chat.GroupID), chat]));
-        chatResults.push(...groups.map(group => buildGroupChatSummaryFromGroup(group, chatByGroupId.get(Number(group.GroupID)), resolvedUserId)));
+        const chatByGroupId = await findExactGroupChatsByGroupIds(
+          db,
+          groups.map(group => group.GroupID),
+          CHAT_SUMMARY_PROJECTION,
+        );
+        chatResults.push(...groups.map(group =>
+          buildGroupChatSummaryFromGroup(group, chatByGroupId.get(Number(group.GroupID)), resolvedUserId),
+        ));
       }
 
       chatResults.sort((a, b) => new Date(String(b.updatedAt || 0)).getTime() - new Date(String(a.updatedAt || 0)).getTime());
@@ -521,7 +708,7 @@ function createMessagesRouter(client, helpers, io) {
   });
 
   router.get("/chats/unread-count", async (req, res) => {
-    const { userId, email } = req.query;
+    const { userId, email, type } = req.query;
 
     try {
       const db = client.db("Users");
@@ -541,26 +728,29 @@ function createMessagesRouter(client, helpers, io) {
 
       let unreadCount = 0;
 
-      const directChats = await db.collection("Chats")
-        .find(
-          { $and: [directLookup, { Type: "direct" }] },
-          { projection: CHAT_UNREAD_PROJECTION },
-        )
-        .toArray();
-      unreadCount += directChats.reduce((sum, chat) => sum + countUnreadMessages(chat, resolvedUserId), 0);
-
-      const groups = await db.collection("Groups")
-        .find(groupLookup, { projection: { GroupID: 1 } })
-        .toArray();
-      const groupIds = groups.map(group => Number(group.GroupID)).filter(Number.isFinite);
-      if (groupIds.length > 0) {
-        const groupChats = await db.collection("Chats")
+      if (type !== "group") {
+        const directChats = await db.collection("Chats")
           .find(
-            { Type: "group", GroupID: { $in: groupIds } },
+            { $and: [directLookup, { Type: "direct" }] },
             { projection: CHAT_UNREAD_PROJECTION },
           )
           .toArray();
-        unreadCount += groupChats.reduce((sum, chat) => sum + countUnreadMessages(chat, resolvedUserId), 0);
+        unreadCount += directChats.reduce((sum, chat) => sum + countUnreadMessages(chat, resolvedUserId), 0);
+      }
+
+      if (type !== "direct") {
+        const groups = await db.collection("Groups")
+          .find(groupLookup, { projection: GROUP_SUMMARY_PROJECTION })
+          .toArray();
+        const chatByGroupId = await findExactGroupChatsByGroupIds(
+          db,
+          groups.map(group => group.GroupID),
+          CHAT_UNREAD_PROJECTION,
+        );
+        unreadCount += groups.reduce(
+          (sum, group) => sum + countUnreadMessages(chatByGroupId.get(Number(group.GroupID)) || {}, resolvedUserId),
+          0,
+        );
       }
 
       return res.status(200).json({ unreadCount });
@@ -600,10 +790,7 @@ function createMessagesRouter(client, helpers, io) {
           return res.status(404).json({ error: "Group not found." });
         }
 
-        const groupChat = await db.collection("Chats").findOne(
-          { Type: "group", GroupID: chatId },
-          { projection: CHAT_DETAIL_PROJECTION },
-        );
+        const groupChat = await findExactGroupChatByGroupId(db, group.GroupID, CHAT_DETAIL_PROJECTION);
         return res.status(200).json({ chat: buildGroupChatFromGroup(group, groupChat, currentUser.UserID) });
       }
 
@@ -700,7 +887,8 @@ function createMessagesRouter(client, helpers, io) {
   });
 
   router.post("/chats/group", async (req, res) => {
-    const { userId, email, groupId } = req.body;
+    const body = req.body || {};
+    const { userId, email, groupId } = body;
 
     if ((!userId && !email) || !groupId) {
       return res.status(400).json({ error: "User and group are required." });
@@ -725,7 +913,7 @@ function createMessagesRouter(client, helpers, io) {
         return res.status(404).json({ error: "Group not found." });
       }
 
-      const existingChat = await db.collection("Chats").findOne({ Type: "group", GroupID: Number(group.GroupID) });
+      const existingChat = await findExactGroupChatByGroupId(db, group.GroupID, CHAT_DETAIL_PROJECTION);
       return res.status(200).json({ chat: buildGroupChatFromGroup(group, existingChat, currentUser.UserID) });
     } catch (error) {
       return res.status(500).json({ error: "Unable to open group chat." });
@@ -734,7 +922,8 @@ function createMessagesRouter(client, helpers, io) {
 
   router.post("/chats/:chatId/messages", async (req, res) => {
     const chatId = Number(req.params.chatId);
-    const { userId, email, text, type } = req.body;
+    const body = req.body || {};
+    const { userId, email, text, type } = body;
 
     if (!chatId || (!userId && !email) || !String(text || "").trim()) {
       return res.status(400).json({ error: "Chat, user, and message text are required." });
@@ -757,24 +946,34 @@ function createMessagesRouter(client, helpers, io) {
         createdAt: new Date(),
       };
 
-      if (type === "group") {
-        const group = await db.collection("Groups").findOne({
-          $and: [
-            { GroupID: chatId },
-            buildGroupMembershipLookup(currentUser.UserID, currentUser.Email, normalizeEmail),
-          ],
-        });
+      const matchedGroup = await db.collection("Groups").findOne({
+        $and: [
+          { GroupID: chatId },
+          buildGroupMembershipLookup(currentUser.UserID, currentUser.Email, normalizeEmail),
+        ],
+      });
+
+      if (type === "group" || (type !== "direct" && matchedGroup)) {
+        const group = matchedGroup;
 
         if (!group) {
           return res.status(404).json({ error: "Group not found." });
         }
 
         await db.collection("Chats").updateOne(
-          { Type: "group", GroupID: chatId },
+          buildGroupChatDocumentLookup(group.GroupID),
           {
             $setOnInsert: buildBaseGroupChat(group),
             $push: { Messages: message },
             $set: {
+              Type: "group",
+              GroupID: Number(group.GroupID),
+              ChatID: Number(group.GroupID),
+              Name: group.Name || "Untitled Group",
+              CreatedByUserId: group.CreatedByUserId,
+              Color: group.Color || "#7c5cfc",
+              Members: group.Members || [],
+              MemberUserIds: (group.Members || []).map(member => String(member.userId)).sort(),
               LastMessageText: message.text,
               LastMessageAt: message.createdAt,
               UpdatedAt: message.createdAt,
@@ -785,19 +984,19 @@ function createMessagesRouter(client, helpers, io) {
         );
 
         const summaryChat = await db.collection("Chats").findOne(
-          { Type: "group", GroupID: chatId },
+          buildGroupChatDocumentLookup(group.GroupID),
           { projection: CHAT_SUMMARY_PROJECTION },
         );
         const responseChat = buildGroupChatSummaryFromGroup(group, summaryChat, currentUser.UserID);
         const responseMessage = buildChatMessage(message, currentUser.UserID);
         if (io) {
-          io.to(buildGroupRoomName(chatId)).emit("chat:updated", { chat: responseChat });
+          io.to(buildGroupRoomName(group.GroupID)).emit("chat:updated", { chat: responseChat });
           for (const member of group.Members || []) {
             io.to(buildUserRoomName(member.userId)).emit("chat:updated", {
               chat: buildGroupChatSummaryFromGroup(group, summaryChat, member.userId),
             });
             io.to(buildUserRoomName(member.userId)).emit("chat:message", {
-              chatId,
+              chatId: Number(group.GroupID),
               type: "group",
               message: buildChatMessage(message, member.userId),
             });
@@ -857,7 +1056,8 @@ function createMessagesRouter(client, helpers, io) {
 
   router.patch("/chats/:chatId/read", async (req, res) => {
     const chatId = Number(req.params.chatId);
-    const { userId, email, type } = req.body;
+    const body = req.body || {};
+    const { userId, email, type } = body;
 
     if (!chatId || (!userId && !email)) {
       return res.status(400).json({ error: "Chat and user are required." });
@@ -873,32 +1073,36 @@ function createMessagesRouter(client, helpers, io) {
 
       const readAt = new Date();
 
-      if (type === "group") {
-        const group = await db.collection("Groups").findOne({
-          $and: [
-            { GroupID: chatId },
-            buildGroupMembershipLookup(currentUser.UserID, currentUser.Email, normalizeEmail),
-          ],
-        });
+      const matchedGroup = await db.collection("Groups").findOne({
+        $and: [
+          { GroupID: chatId },
+          buildGroupMembershipLookup(currentUser.UserID, currentUser.Email, normalizeEmail),
+        ],
+      });
+
+      if (type === "group" || (type !== "direct" && matchedGroup)) {
+        const group = matchedGroup;
 
         if (!group) {
           return res.status(404).json({ error: "Group not found." });
         }
 
-        const existingChat = await db.collection("Chats").findOne({ Type: "group", GroupID: chatId });
-        const baseGroupChat = existingChat || buildBaseGroupChat(group);
-        const updatedChat = {
-          ...baseGroupChat,
-          UpdatedAt: baseGroupChat.UpdatedAt || readAt,
-          ReadState: {
-            ...(baseGroupChat.ReadState || {}),
-            [String(currentUser.UserID)]: readAt,
-          },
-        };
-
         await db.collection("Chats").updateOne(
-          { Type: "group", GroupID: chatId },
-          { $set: updatedChat },
+          buildGroupChatDocumentLookup(group.GroupID),
+          {
+            $setOnInsert: buildBaseGroupChat(group),
+            $set: {
+              Type: "group",
+              GroupID: Number(group.GroupID),
+              ChatID: Number(group.GroupID),
+              Name: group.Name || "Untitled Group",
+              CreatedByUserId: group.CreatedByUserId,
+              Color: group.Color || "#7c5cfc",
+              Members: group.Members || [],
+              MemberUserIds: (group.Members || []).map(member => String(member.userId)).sort(),
+              [`ReadState.${String(currentUser.UserID)}`]: readAt,
+            },
+          },
           { upsert: true },
         );
 

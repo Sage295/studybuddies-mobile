@@ -75,3 +75,23 @@ export async function saveProfile(profile: {
 
   return data as SavedProfile;
 }
+
+export async function uploadProfileAvatar(file: File) {
+  const user = getIdentity();
+  const formData = new FormData();
+  formData.append("avatar", file);
+  formData.append("userId", String(user.userId ?? ""));
+  formData.append("email", String(user.email ?? ""));
+
+  const res = await fetch(`${PROFILE_API_URL}/avatar`, {
+    method: "POST",
+    body: formData,
+  });
+  const data = await parseResponse(res);
+
+  if (!res.ok) {
+    throw new Error(data.error || "Unable to upload avatar.");
+  }
+
+  return data as { avatarUrl: string };
+}

@@ -6,6 +6,7 @@ const jwt = require("jsonwebtoken");
 const bcrypt = require("bcrypt");
 const nodemailer = require("nodemailer");
 const { MailtrapTransport } = require("mailtrap");
+const multer = require("multer");
 const mongoose = require("mongoose");
 const fs = require("fs");
 const path = require("path");
@@ -57,6 +58,28 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
+const avatarStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename: (req, file, cb) => {
+    const extension = path.extname(file.originalname || "").toLowerCase();
+    const safeExtension = [".png", ".jpg", ".jpeg", ".webp"].includes(extension) ? extension : ".jpg";
+    cb(null, `avatar-${Date.now()}-${crypto.randomUUID()}${safeExtension}`);
+  },
+});
+
+const avatarUpload = multer({
+  storage: avatarStorage,
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (["image/png", "image/jpeg", "image/webp"].includes(file.mimetype)) {
+      cb(null, true);
+      return;
+    }
+
+    cb(new Error("Only PNG, JPG, and WEBP images are allowed."));
+  },
+});
+
 const frontendUrl = config.frontendUrl;
 const apiBaseUrl = config.apiBaseUrl;
 const JWT_SECRET = config.jwtSecret;
@@ -79,9 +102,32 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+app.use("/api/uploads", express.static(uploadsDir));
+
+async function ensureMongoIndexes() {
+  const db = client.db("Users");
+
+  await Promise.all([
+    db.collection("Chats").createIndex({ Type: 1, ChatID: 1 }, { name: "chat_type_chatId" }),
+    db.collection("Chats").createIndex({ Type: 1, GroupID: 1 }, { name: "chat_type_groupId" }),
+    db.collection("Chats").createIndex({ Type: 1, MemberUserIds: 1, UpdatedAt: -1 }, { name: "chat_type_members_updatedAt" }),
+    db.collection("Chats").createIndex({ "Members.userId": 1, Type: 1 }, { name: "chat_members_userId_type" }),
+    db.collection("Chats").createIndex({ "Members.email": 1, Type: 1 }, { name: "chat_members_email_type" }),
+    db.collection("Groups").createIndex({ GroupID: 1 }, { name: "group_groupId" }),
+    db.collection("Groups").createIndex({ "Members.userId": 1, CreatedAt: -1 }, { name: "group_members_userId_createdAt" }),
+    db.collection("Groups").createIndex({ "Members.email": 1, CreatedAt: -1 }, { name: "group_members_email_createdAt" }),
+    db.collection("Accounts").createIndex({ UserID: 1 }, { name: "account_userId" }),
+    db.collection("Accounts").createIndex({ Email: 1 }, { name: "account_email" }),
+    db.collection("Accounts").createIndex({ UsernameNormalized: 1 }, { name: "account_username_normalized" }),
+  ]);
+}
 
 client.connect()
-  .then(() => console.log("MongoDB connected"))
+  .then(async () => {
+    console.log("MongoDB connected");
+    await ensureMongoIndexes();
+    console.log("MongoDB indexes ready");
+  })
   .catch(err => console.error(err));
 
 mongoose
@@ -208,6 +254,15 @@ function buildDisplayName(account) {
   return fullName || normalizeEmail(account.Email).split("@")[0] || "User";
 }
 
+function normalizeAvatarUrl(value) {
+  const avatarUrl = String(value || "").trim();
+  if (!avatarUrl || avatarUrl.startsWith("data:")) {
+    return null;
+  }
+
+  return avatarUrl;
+}
+
 function buildMemberFromAccount(account, overrides = {}) {
   return {
     userId: account.UserID,
@@ -216,7 +271,7 @@ function buildMemberFromAccount(account, overrides = {}) {
     email: normalizeEmail(account.Email),
     isCreator: Boolean(overrides.isCreator),
     color: overrides.color || account.AvatarColor || "#5b8dee",
-    avatarUrl: overrides.avatarUrl || account.AvatarUrl || undefined,
+    avatarUrl: normalizeAvatarUrl(overrides.avatarUrl || account.AvatarUrl) || undefined,
   };
 }
 
@@ -225,6 +280,7 @@ const GROUP_LIST_PROJECTION = {
   Name: 1,
   CreatedByUserId: 1,
   Color: 1,
+  AvatarUrl: 1,
   CreatedAt: 1,
   Events: 1,
   "Members.username": 1,
@@ -232,6 +288,7 @@ const GROUP_LIST_PROJECTION = {
   "Members.email": 1,
   "Members.isCreator": 1,
   "Members.color": 1,
+  "Members.avatarUrl": 1,
 };
 
 const ACCOUNT_PUBLIC_PROJECTION = {
@@ -242,6 +299,7 @@ const ACCOUNT_PUBLIC_PROJECTION = {
   FirstName: 1,
   LastName: 1,
   DisplayName: 1,
+  AvatarUrl: 1,
   AvatarColor: 1,
 };
 
@@ -254,7 +312,7 @@ const ACCOUNT_LOGIN_PROJECTION = {
 function buildUserProfile(account) {
   return {
     displayName: buildDisplayName(account),
-    avatarUrl: null,
+    avatarUrl: normalizeAvatarUrl(account.AvatarUrl),
     avatarColor: account.AvatarColor || "#5b8dee",
   };
 }
@@ -754,6 +812,40 @@ app.put("/api/profile", async (req, res) => {
     return res.status(200).json(buildUserResponse(updatedUser));
   } catch (error) {
     return res.status(500).json({ error: "Unable to update profile." });
+  }
+});
+
+app.post("/api/profile/avatar", avatarUpload.single("avatar"), async (req, res) => {
+  const { userId, email } = req.body;
+
+  if (!req.file) {
+    return res.status(400).json({ error: "Avatar image is required." });
+  }
+
+  try {
+    const db = client.db("Users");
+    const user = await findAccountByIdentity(db, { userId, email });
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    const forwardedProto = req.get("x-forwarded-proto");
+    const protocol = forwardedProto ? forwardedProto.split(",")[0].trim() : req.protocol;
+    const avatarUrl = `${protocol}://${req.get("host")}/api/uploads/${req.file.filename}`;
+
+    await db.collection("Accounts").updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          AvatarUrl: avatarUrl,
+        },
+      },
+    );
+
+    return res.status(200).json({ avatarUrl });
+  } catch (error) {
+    return res.status(500).json({ error: "Unable to upload avatar." });
   }
 });
 
